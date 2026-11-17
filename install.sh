@@ -7,10 +7,14 @@
 #   ./install.sh --no-agents     # runtime + menu-bar app, leave agent configs alone
 #   ./install.sh --uninstall     # stop the app and remove the login item (agent configs stay)
 #   ./install.sh --print         # the MCP config, for any other agent; installs nothing
+#   LARMOR_BACKEND=gemini|local  # pick the voice without being asked
 #
-# Everything runs on your Mac: Parakeet for speech-to-text, Chatterbox for the voice,
-# Apple's echo canceller so you can talk over it. Apple Silicon only. The first launch
-# downloads about 3.7 GB of models in the background; the menu-bar icon shows progress.
+# Two voices. Local: Parakeet for speech-to-text, Chatterbox for the voice, all on your Mac;
+# the first launch downloads about 3.7 GB of models in the background. Gemini: Gemini Live
+# listens, talks and chats with you while your agent works; needs a Gemini API key, which you
+# put in the .env file of this folder with an editor (the installer creates it, mode 600, and
+# never asks for the key on the terminal), no download. Both use Apple's echo canceller so you
+# can talk over it. Apple Silicon only.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,10 +23,12 @@ PY="$VENV/bin/python"
 SERVER="$DIR/larmor_server.py"
 SKILL="$DIR/skills/larmor/SKILL.md"
 LABEL="dev.larmor.menubar"
-# The only thing Larmor ever sends anywhere, and only if the user types it: an email
+# The only thing Larmor itself ever sends anywhere, and only if the user types it: an email
 # for updates, and feedback from the menu bar. No usage data, no audio, no transcripts.
+# (With the Gemini voice, the user's audio goes to Google under their own key.)
 SIGNUP_URL="${LARMOR_SIGNUP_URL:-https://2htivf76db7g5cbqk2zaq4r25a0vcnxj.lambda-url.ap-south-1.on.aws/}"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+ENV_FILE="$DIR/.env"              # KEY=value lines every Larmor process loads; see larmor_env.py
 
 LOG="$HOME/.larmor/install.log"
 
@@ -44,7 +50,7 @@ banner() {
   printf '\n'
   printf '  %s╻  ┏━┓┏━┓┏┳┓┏━┓┏━┓%s\n' "$G" "$X"
   printf '  %s┃  ┣━┫┣┳┛┃┃┃┃ ┃┣┳┛%s   %sTalk to your coding agent.%s\n' "$G" "$X" "$B" "$X"
-  printf '  %s┗━╸╹ ╹╹┗╸╹ ╹┗━┛╹┗╸%s   %sRuns on your Mac · free in beta%s\n\n' "$G" "$X" "$D" "$X"
+  printf '  %s┗━╸╹ ╹╹┗╸╹ ╹┗━┛╹┗╸%s   %sOn your Mac, or with Gemini Live · free in beta%s\n\n' "$G" "$X" "$D" "$X"
 }
 
 took() {  # seconds since $1, as "12s" or "1m 05s"
@@ -101,8 +107,9 @@ EOF
 # ── runtime ───────────────────────────────────────────────────────────────────
 
 # What Larmor needs, checked up front so nobody finds out halfway through.
-# Measured: the engine holds about 2-3 GB of memory with both models loaded; the models
-# are about 3.7 GB on disk and the Python environment about 0.8 GB.
+# Measured: the engine holds about 2-3 GB of memory with both local models loaded; the
+# models are about 3.7 GB on disk and the Python environment about 0.8 GB. The Gemini voice
+# loads no models: under 1 GB of disk and memory.
 check_mac() {
   [ "$(uname -s)" = Darwin ] || die "Larmor runs on macOS only."
   local chip os major mem_gb free_gb
@@ -114,6 +121,13 @@ check_mac() {
   [ "$(uname -m)" = arm64 ] || die "Larmor needs an Apple Silicon Mac (M1 or later). This one is $chip."
   [ "$major" -ge 14 ] || die "Larmor needs macOS 14 or later. This Mac has $os."
   ok "$(printf '%-30s' "$chip, macOS $os")" "Apple Silicon, macOS 14 or later"
+  if [ "$BACKEND" = gemini ]; then
+    ok "$(printf '%-30s' "$mem_gb GB memory")" "uses under 1 GB while it runs (the voice is Gemini's)"
+    [ "$free_gb" -ge 2 ] || die "Larmor needs 2 GB of free disk; it uses about 1 GB. This Mac has $free_gb GB free."
+    ok "$(printf '%-30s' "$free_gb GB free disk")" "uses about 1 GB: Python and the app, no voice models"
+    printf '\n'
+    return
+  fi
   if [ "$mem_gb" -lt 8 ]; then
     die "Larmor needs at least 8 GB of memory. This Mac has $mem_gb GB."
   elif [ "$mem_gb" -lt 16 ]; then
@@ -126,6 +140,72 @@ check_mac() {
   printf '\n'
 }
 
+# ── which voice ───────────────────────────────────────────────────────────────
+# Gemini Live or the local models. Asked first: it decides what the rest of the install
+# checks and downloads. LARMOR_BACKEND=gemini|local skips the question; without a terminal
+# the key decides, as the MCP server does at run time. The key lives in $DIR/.env, next to the
+# code, never in a shell profile or an agent's config: every Larmor process reads it at start. The
+# installer never asks for the key: typed on a terminal it would end up in a history or a log.
+# It creates the file with an empty GEMINI_API_KEY= line for the user to fill in.
+
+env_get() {  # name -> value from $ENV_FILE, or nothing
+  [ -f "$ENV_FILE" ] || return 0
+  sed -n -e "s/^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}$1[[:space:]]*=[[:space:]]*//p" "$ENV_FILE" \
+    | tail -n 1 | sed -e "s/^[\"']//" -e "s/[\"']\$//"
+}
+
+env_set() {  # name value: replace or append the line, file mode 600
+  mkdir -p "$(dirname "$ENV_FILE")"
+  ( umask 077; touch "$ENV_FILE" )
+  chmod 600 "$ENV_FILE"
+  grep -v "^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}$1[[:space:]]*=" "$ENV_FILE" > "$ENV_FILE.tmp" 2>/dev/null || true
+  printf '%s=%s\n' "$1" "$2" >> "$ENV_FILE.tmp"
+  chmod 600 "$ENV_FILE.tmp"; mv "$ENV_FILE.tmp" "$ENV_FILE"
+}
+
+have_key() { [ -n "${GEMINI_API_KEY:-}${GOOGLE_API_KEY:-}$(env_get GEMINI_API_KEY)$(env_get GOOGLE_API_KEY)" ]; }
+
+make_env_file() {  # $ENV_FILE with a blank key line to fill in, if there is no key line yet
+  mkdir -p "$(dirname "$ENV_FILE")"
+  if [ ! -f "$ENV_FILE" ]; then
+    ( umask 077; cat > "$ENV_FILE" <<'EOF'
+# Larmor settings. One KEY=value per line; every Larmor process reads this file at start.
+# Readable by you only. Never paste the key on a terminal: it would end up in a history or a log.
+GEMINI_API_KEY=
+# LARMOR_GEMINI_VOICE=Kore      LARMOR_GEMINI_SILENCE_MS=1000     LARMOR_AGENT_VOICE=gemini|local
+# LARMOR_GEMINI_COMPRESS_TRIGGER=8000  LARMOR_GEMINI_COMPRESS_TARGET=4000  (Gemini's memory; see README)
+EOF
+    )
+  elif ! grep -q "^[[:space:]]*\(export[[:space:]]\{1,\}\)\{0,1\}\(GEMINI\|GOOGLE\)_API_KEY[[:space:]]*=" "$ENV_FILE"; then
+    printf 'GEMINI_API_KEY=\n' >> "$ENV_FILE"
+  fi
+  chmod 600 "$ENV_FILE"
+}
+
+choose_backend() {
+  local line guess
+  BACKEND="${LARMOR_BACKEND:-}"
+  if have_key; then guess=gemini; else guess=local; fi
+  if [ -z "$BACKEND" ] && (: </dev/tty) 2>/dev/null; then
+    printf '  %sWhich voice?%s\n' "$B" "$X"
+    printf '    1) Gemini Live: Gemini listens, talks and chats with you while your agent works.\n'
+    printf '       About $0.50 an hour on your Google API key (%s).\n' "$(have_key && echo "found in $ENV_FILE" || echo "you add it to $ENV_FILE afterwards")"
+    printf '    2) Local: Parakeet and Chatterbox on this Mac. 3.7 GB of models, nothing leaves it.\n'
+    printf '  1 or 2 (enter for %s): ' "$guess"
+    IFS= read -r line </dev/tty || die "Cancelled."
+    case "$line" in 1) BACKEND=gemini ;; 2) BACKEND=local ;; "") BACKEND=$guess ;; *) die "Pick 1 or 2." ;; esac
+  fi
+  : "${BACKEND:=$guess}"
+  case "$BACKEND" in
+    gemini) make_env_file
+            ok "Voice: Gemini Live" "$(have_key || printf 'no key yet: %s is ready for it, see the end' "$ENV_FILE")" ;;
+    local)  ok "Voice: the local models" ;;
+    *) die "LARMOR_BACKEND must be gemini or local, not \"$BACKEND\"." ;;
+  esac
+  env_set LARMOR_BACKEND "$BACKEND"                # the MCP server and the engine read it from the file
+  printf '\n'
+}
+
 install_uv() {
   curl -LsSf https://astral.sh/uv/install.sh | sh
 }
@@ -133,6 +213,13 @@ install_uv() {
 install_runtime() {
   [ -x "$PY" ] || uv venv -q --python 3.12 "$VENV"
   VIRTUAL_ENV="$VENV" uv pip install -q -r "$DIR/requirements.txt"
+  # rumps posts the "ready" notification through the app bundle of the running python, and a
+  # venv python has none: give it a one-key Info.plist, or every notification raises.
+  [ -f "$VENV/bin/Info.plist" ] || cat > "$VENV/bin/Info.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>dev.larmor.menubar</string></dict></plist>
+EOF
   chmod +x "$DIR/native/larmor_audio"
   xattr -d com.apple.quarantine "$DIR/native/larmor_audio" 2>/dev/null || true
 }
@@ -147,6 +234,8 @@ install_app() {
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key>
   <array><string>$PY</string><string>$DIR/app/larmor_menubar.py</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>LARMOR_BACKEND</key><string>$BACKEND</string></dict>
   <key>RunAtLoad</key><true/>
   <!-- restart after a crash, but not after "Quit Larmor" from the menu -->
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
@@ -197,6 +286,12 @@ has_antigravity() { command -v agy >/dev/null || [ -d ~/.gemini/antigravity-cli 
 
 put_skill() {  # skills-dir
   mkdir -p "$1/larmor"
+  # The skill asks the agent to write the user's corrections into the installed copy, so an
+  # edited one is theirs: keep it next to the new file instead of silently overwriting it.
+  if [ -f "$1/larmor/SKILL.md" ] && ! cmp -s "$SKILL" "$1/larmor/SKILL.md"; then
+    cp "$1/larmor/SKILL.md" "$1/larmor/SKILL.md.bak-larmor"
+    say "  (your edited $1/larmor/SKILL.md was kept as SKILL.md.bak-larmor; merge what you want back)"
+  fi
   cp "$SKILL" "$1/larmor/SKILL.md"
 }
 
@@ -492,6 +587,10 @@ wire_agents() {
 # the background. On a pipe (an agent running us) don't wait: the icon shows progress.
 follow_models() {
   MODELS_READY=0
+  if [ "$BACKEND" = gemini ]; then
+    MODELS_READY=1                                 # nothing to fetch: the voice is Gemini's
+    return 0
+  fi
   if [ "$FANCY" != 1 ]; then
     say "  → The voice models (about 3.7 GB) download in the background; the menu-bar icon shows progress."
     return 0
@@ -589,7 +688,13 @@ PYEOF
 finish() {
   local k=0 id
   num() { k=$((k + 1)); printf '  %s%d%s  ' "$E" "$k" "$X"; }
-  if [ "$MODELS_READY" = 1 ]; then
+  if [ "$BACKEND" = gemini ] && ! have_key; then
+    printf '\n  %sLarmor is installed.%s\n\n' "$B" "$X"
+    num; printf 'Open %s%s%s in your editor and fill in the %sGEMINI_API_KEY=%s line.\n' "$B" "$ENV_FILE" "$X" "$B" "$X"
+    printf '       The file is readable by you only and every Larmor process reads it; nothing goes in a\n'
+    printf '       shell profile or an agent config. Don'\''t paste the key on a terminal, it would be logged.\n'
+    printf '       %sNo key? LARMOR_BACKEND=local in the same file switches to the on-device models.%s\n' "$D" "$X"
+  elif [ "$MODELS_READY" = 1 ]; then
     printf '\n  %sLarmor is ready.%s\n\n' "$B" "$X"
   else
     printf '\n  %sLarmor is installed.%s\n\n' "$B" "$X"
@@ -629,6 +734,7 @@ main() {
   trap '[ "$FANCY" = 1 ] && printf "\033[?25h"; stty echo </dev/tty 2>/dev/null || true' EXIT
   mkdir -p "$HOME/.larmor"; : > "$LOG"
   banner
+  choose_backend
   check_mac
   get_email
   choose_agents

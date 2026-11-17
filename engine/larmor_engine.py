@@ -12,12 +12,17 @@ header, or someone else's Host after DNS rebinding) is refused, so a web page ca
 
 First run downloads the models (about 3 GB) and /health reports the progress.
 
+With LARMOR_BACKEND=gemini (the default when GEMINI_API_KEY is set) Gemini Live is the voice
+and nothing is downloaded or loaded here, unless LARMOR_AGENT_VOICE=local asks for Chatterbox
+to say the agent's lines verbatim: then only the voice loads. /health says which.
+
     python engine/larmor_engine.py            # port 8160, or LARMOR_ENGINE_PORT
 """
 import asyncio
 import io
 import os
 import queue
+import sys
 import threading
 import time
 import traceback
@@ -27,11 +32,17 @@ from pathlib import Path
 import numpy as np
 from aiohttp import web
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import larmor_env  # noqa: E402,F401  (the app folder's .env -> os.environ)
+
 PORT = int(os.getenv("LARMOR_ENGINE_PORT", "8160"))
 STT_MODEL = os.getenv("LARMOR_STT_MODEL", "mlx-community/parakeet-tdt-0.6b-v2")
 TTS_MODEL = os.getenv("LARMOR_TTS_MODEL", "mlx-community/chatterbox-turbo-8bit")
 S3TOK = "mlx-community/S3TokenizerV2"   # Chatterbox Turbo fetches this at load; count it in the download
 SR = 16000
+BACKEND = os.getenv("LARMOR_BACKEND") or ("gemini" if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") else "local")
+WANT = {"stt": BACKEND == "local",
+        "tts": BACKEND == "local" or os.getenv("LARMOR_AGENT_VOICE") == "local"}
 
 STATE = {"state": "starting", "detail": "", "progress": 0.0,
          "downloaded_mb": 0, "total_mb": 0, "stt": False, "tts": False, "tts_sr": 24000}
@@ -60,10 +71,12 @@ def download_models() -> None:
     Progress comes from huggingface_hub's own network byte counter (its
     "Downloading bytes" bar), hooked through tqdm_class. Watching blobs/ on disk doesn't work: Xet
     downloads don't grow the file as they go."""
+    repos = ([STT_MODEL] if WANT["stt"] else []) + ([TTS_MODEL, S3TOK] if WANT["tts"] else [])
+    only = {S3TOK: ["model.safetensors"]}
+    if not repos:
+        return
     from huggingface_hub import HfApi, snapshot_download
     from huggingface_hub.utils import tqdm as hf_tqdm
-    repos = [STT_MODEL, TTS_MODEL, S3TOK]
-    only = {S3TOK: ["model.safetensors"]}
     try:
         api = HfApi()
         total = sum(sum((s.size or 0) for s in api.model_info(r, files_metadata=True).siblings
@@ -170,10 +183,12 @@ def boot():
     try:
         download_models()
         STATE.update(state="loading", detail="")
-        threading.Thread(target=stt_worker, daemon=True, name="stt").start()
-        threading.Thread(target=tts_worker, daemon=True, name="tts").start()
+        if WANT["stt"]:
+            threading.Thread(target=stt_worker, daemon=True, name="stt").start()
+        if WANT["tts"]:
+            threading.Thread(target=tts_worker, daemon=True, name="tts").start()
         for name, ev in loaded.items():
-            while not ev.wait(1):
+            while WANT[name] and not ev.wait(1):
                 pass
         STATE.update(state="ready")
         log("ready")
@@ -199,6 +214,9 @@ async def local_only(req: web.Request, handler):
 
 async def _submit(q: queue.Queue, ev: threading.Event, *args):
     if not ev.is_set():
+        name = "stt" if q is stt_jobs else "tts"
+        if not WANT[name]:
+            raise web.HTTPServiceUnavailable(text=f"no local {name}: the {BACKEND} backend handles it")
         raise web.HTTPServiceUnavailable(text=f"engine {STATE['state']}")
     loop = asyncio.get_running_loop()
     fut = loop.create_future()
@@ -241,8 +259,9 @@ async def warm(_):
 
 
 async def health(_):
-    return web.json_response({"ok": STATE["state"] == "ready", **STATE,
-                              "stt_model": STT_MODEL, "tts_model": TTS_MODEL})
+    return web.json_response({"ok": STATE["state"] == "ready", **STATE, "backend": BACKEND,
+                              "stt_model": STT_MODEL if WANT["stt"] else None,
+                              "tts_model": TTS_MODEL if WANT["tts"] else None})
 
 
 def watch_parent():

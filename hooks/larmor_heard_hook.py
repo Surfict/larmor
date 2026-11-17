@@ -54,7 +54,10 @@ def main() -> int:
         t, text = float(ev.get("wall_clock") or 0), (ev.get("text") or "").strip()
         if ev.get("type") != "turn" or not text or t <= since:
             continue
-        said.append(("(you were cut off mid-sentence) " if ev.get("interrupted_agent") else "") + text)
+        if ev.get("ear") is not None and s.get("ear_pid") is not None and ev["ear"] != s["ear_pid"]:
+            continue                                  # another ear's hand-off (a ghost, or a takeover)
+        cut = ev.get("interrupted_agent") and s.get("backend") != "gemini"   # with Gemini a cut-off is ordinary conversation
+        said.append(("(you were cut off mid-sentence) " if cut else "") + text)
         newest = max(newest, t)
     if not said:
         return 0
@@ -63,11 +66,12 @@ def main() -> int:
         f.write(repr(newest))
     os.replace(tmp, DELIVERED)
     quoted = "\n".join(f'  "{t}"' for t in said)
+    who = "the voice assistant handed you this" if s.get("backend") == "gemini" else "the user said (by voice)"
     _SAID.append(1)
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PostToolUse",
         "additionalContext": (
-            "[Larmor] While you were working, the user said (by voice):\n" + quoted + "\n"
+            f"[Larmor] While you were working, {who}:\n" + quoted + "\n"
             "This will NOT come through listen(). Act on it now: acknowledge it with speak(), "
             "and change course if it redirects your work."),
     }}))

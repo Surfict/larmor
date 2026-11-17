@@ -69,3 +69,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 | S3TokenizerV2 (used by Chatterbox) | xingchensong/S3Tokenizer, via mlx-community | Apache 2.0 (upstream) |
 
 Python dependencies are listed in `requirements.txt`, each under its own licence.
+
+## Not bundled, not downloaded: the Gemini voice
+
+With `LARMOR_BACKEND=gemini`, speech recognition, turn-taking and the voice are Google's Gemini
+Live API, reached with the user's own API key through the `google-genai` package (Apache 2.0).
+Use of that service is under Google's Gemini API terms, not this licence.

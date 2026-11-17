@@ -44,7 +44,7 @@ VAD_MODEL = os.getenv("LARMOR_VAD_MODEL", str(HERE / "models" / "silero_vad.onnx
 AUDIO_BIN = os.getenv("LARMOR_AUDIO_BIN", str(HERE / "native" / "larmor_audio"))
 ENGINE = os.getenv("LARMOR_ENGINE_URL", "http://127.0.0.1:8160")   # engine/larmor_engine.py
 OUT = Path(os.getenv("LARMOR_TURNS", os.path.expanduser("~/.larmor/turns.jsonl")))
-INFO = Path(os.path.expanduser("~/.larmor/ear.json"))
+INFO = Path(os.getenv("LARMOR_EAR_INFO", os.path.expanduser("~/.larmor/ear.json")))
 
 START_P, END_P = 0.6, 0.35        # VAD hysteresis: enter speech above START, leave below END
 MIN_SPEECH_S = 0.30               # shorter than this is a click or a cough
@@ -131,6 +131,7 @@ def transcribe(audio: np.ndarray) -> str:
 
 
 def emit(ev: dict):
+    ev.setdefault("ear", os.getpid())    # whose hand-off this is: a server only reads its own ear's
     OUT.parent.mkdir(exist_ok=True)
     with OUT.open("a") as f:
         f.write(json.dumps(ev) + "\n")
@@ -203,6 +204,33 @@ class Audio:
             pass
 
 
+def render_tts(text: str, rate: int) -> np.ndarray | None:
+    """One line through the local engine's voice, as int16 at the speaker's rate."""
+    try:
+        r = requests.post(f"{ENGINE}/speak", json={"text": text}, timeout=60)
+        r.raise_for_status()
+        import io
+        import wave
+        with wave.open(io.BytesIO(r.content), "rb") as w:
+            sr, ch = w.getframerate(), w.getnchannels()
+            x = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+        if ch > 1:
+            x = x.reshape(-1, ch).mean(axis=1).astype(np.int16)
+        y = soxr.resample(x.astype(np.float32) / 32768.0, sr, rate)
+        return (np.clip(y, -1, 1) * 32767).astype(np.int16)
+    except Exception as e:
+        log("tts failed:", e)
+        return None
+
+
+def is_local(headers) -> bool:
+    """Only Larmor's MCP server calls the ear. Refuse anything a browser sends: browsers add
+    Origin on cross-site POSTs and Sec-Fetch-Site on modern requests, and a DNS-rebinding
+    page arrives with its own Host."""
+    host = (headers.get("Host") or "").rsplit(":", 1)[0]
+    return not (headers.get("Origin") or headers.get("Sec-Fetch-Site")) and host in ("127.0.0.1", "localhost")
+
+
 def is_backchannel(text: str) -> bool:
     t = re.sub(r"[^a-z' -]", "", text.lower()).strip()
     return not t or t in BACKCHANNEL or all(w in BACKCHANNEL for w in t.split())
@@ -262,21 +290,7 @@ class Mouth:
         return was
 
     def _render(self, text: str) -> np.ndarray | None:
-        try:
-            r = requests.post(f"{ENGINE}/speak", json={"text": text}, timeout=60)
-            r.raise_for_status()
-            import io
-            import wave
-            with wave.open(io.BytesIO(r.content), "rb") as w:
-                sr, ch = w.getframerate(), w.getnchannels()
-                x = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
-            if ch > 1:
-                x = x.reshape(-1, ch).mean(axis=1).astype(np.int16)
-            y = soxr.resample(x.astype(np.float32) / 32768.0, sr, self.audio.ref_rate)
-            return (np.clip(y, -1, 1) * 32767).astype(np.int16)
-        except Exception as e:
-            log("tts failed:", e)
-            return None
+        return render_tts(text, self.audio.ref_rate)
 
     def _render_loop(self):
         while True:
@@ -333,12 +347,10 @@ class Control(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
     def _local(self) -> bool:
-        """Only Larmor's MCP server calls this. Refuse anything a browser sends."""
-        host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
-        if self.headers.get("Origin") or self.headers.get("Sec-Fetch-Site") or host not in ("127.0.0.1", "localhost"):
-            self._send({"error": "local programs only"}, 403)
-            return False
-        return True
+        if is_local(self.headers):
+            return True
+        self._send({"error": "local programs only"}, 403)
+        return False
 
     def do_GET(self):
         if not self._local():

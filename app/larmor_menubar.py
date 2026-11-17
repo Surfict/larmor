@@ -19,6 +19,8 @@ from pathlib import Path
 import rumps
 
 HERE = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(HERE))
+import larmor_env  # noqa: E402,F401  (the app folder's .env -> os.environ, so the engine inherits the key and backend)
 PORT = int(os.getenv("LARMOR_ENGINE_PORT", "8160"))
 HEALTH = f"http://127.0.0.1:{PORT}/health"
 HOME = Path.home() / ".larmor"
@@ -53,6 +55,8 @@ def describe(h, running: bool) -> str:
     if st == "loading":
         return "Loading models…"
     if st == "ready":
+        if h.get("backend") == "gemini":
+            return "Ready (Gemini voice) — type /larmor in your agent"
         return "Ready — type /larmor in your agent"
     if st == "error":
         return f"Error: {h.get('detail', '')[:60]}"
@@ -133,9 +137,13 @@ class App(rumps.App):
         self.status.title = describe(h, self.engine.wanted)
         self.toggle.title = "Stop engine" if self.engine.wanted else "Start engine"
         ready = st == "ready"
-        if ready and self.was_ready is False:          # only after we watched it get ready
-            rumps.notification("Larmor", "Ready", "Voice mode is ready. Type /larmor in your agent.")
-        self.was_ready = ready
+        notify = ready and self.was_ready is False     # only after we watched it get ready
+        self.was_ready = ready                         # set first: a failed notification must not retry every second
+        if notify:
+            try:
+                rumps.notification("Larmor", "Ready", "Voice mode is ready. Type /larmor in your agent.")
+            except Exception as e:  # noqa: BLE001  (no Info.plist next to python: rumps can't post; not worth a log a second)
+                print("notification skipped:", str(e).splitlines()[0], flush=True)
 
     def set_symbol(self, name: str):
         if name == self.symbol:
